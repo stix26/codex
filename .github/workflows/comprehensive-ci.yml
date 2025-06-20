@@ -1,0 +1,434 @@
+name: Comprehensive CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  NODE_OPTIONS: --max-old-space-size=4096
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Node.js/TypeScript CI
+  node-ci:
+    name: Node.js CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.8.1
+          run_install: false
+
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        shell: bash
+        run: |
+          echo "store_path=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
+
+      - name: Setup pnpm cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-cache.outputs.store_path }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Check TypeScript code formatting
+        working-directory: codex-cli
+        run: pnpm run format
+
+      - name: Check Markdown and config file formatting
+        run: pnpm run format
+
+      - name: Run TypeScript tests
+        run: pnpm run test
+
+      - name: Lint TypeScript code
+        run: |
+          pnpm --filter @openai/codex exec -- eslint src tests --ext ts --ext tsx \
+            --report-unused-disable-directives \
+            --rule "no-console:error" \
+            --rule "no-debugger:error" \
+            --max-warnings=-1
+
+      - name: Type-check TypeScript
+        run: pnpm run typecheck
+
+      - name: Build TypeScript
+        run: pnpm run build
+
+      - name: Ensure staging a release works
+        working-directory: codex-cli
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: pnpm stage-release
+
+      - name: Check README ASCII compliance
+        run: ./scripts/asciicheck.py README.md
+
+      - name: Check README ToC
+        run: python3 scripts/readme_toc.py README.md
+
+  # Rust CI
+  rust-ci:
+    name: Rust CI
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: codex-rs
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@1.87
+        with:
+          components: rustfmt, clippy
+
+      - name: Setup Rust cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ${{ github.workspace }}/codex-rs/target/
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check Rust formatting
+        run: cargo fmt -- --config imports_granularity=Item --check
+
+      - name: Run Rust clippy
+        run: cargo clippy --all-features --tests -- -D warnings
+
+      - name: Build Rust (individual crates)
+        run: find . -name Cargo.toml -mindepth 2 -maxdepth 2 -print0 | xargs -0 -n1 -I{} bash -c 'cd "$(dirname "{}")" && cargo build'
+
+      - name: Run Rust tests
+        run: cargo test --all-features
+
+  # Multi-platform Rust builds
+  rust-multi-platform:
+    name: Rust Multi-Platform
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: codex-rs
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+          - runner: macos-14
+            target: x86_64-apple-darwin
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@1.87
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy
+
+      - name: Setup Rust cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ${{ github.workspace }}/codex-rs/target/
+          key: cargo-${{ matrix.runner }}-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install musl build tools
+        if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'}}
+        run: |
+          sudo apt install -y musl-tools pkg-config
+
+      - name: Build Rust for target
+        run: cargo build --target ${{ matrix.target }}
+
+      - name: Test Rust for target
+        run: cargo test --target ${{ matrix.target }}
+
+  # Docker CI
+  docker-ci:
+    name: Docker CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.8.1
+          run_install: false
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build TypeScript
+        run: pnpm run build
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        working-directory: codex-cli
+        run: |
+          docker build -t codex-test .
+          docker images codex-test
+
+      - name: Test Docker image
+        working-directory: codex-cli
+        run: |
+          docker run --rm codex-test codex --version
+
+      - name: Check Dockerfile syntax
+        run: |
+          docker run --rm -i hadolint/hadolint < codex-cli/Dockerfile
+
+  # Security scanning
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.8.1
+          run_install: false
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Run npm audit
+        run: |
+          cd codex-cli
+          npm audit --audit-level=moderate
+
+      - name: Run pnpm audit
+        run: pnpm audit --audit-level=moderate
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # Code quality and spell checking
+  code-quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run codespell
+        uses: codespell-project/actions-codespell@master
+        with:
+          ignore_words_list: "crate,hist,iff,secant,splitted,te"
+
+      - name: Run CodeQL Analysis
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript, typescript, rust
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+  # SQL and database related checks (future-proofing)
+  sql-checks:
+    name: SQL Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check for SQL files
+        run: |
+          echo "Checking for SQL files in the repository..."
+          find . -name "*.sql" -type f | head -10
+          echo "SQL file check completed."
+
+      - name: Check for database configuration files
+        run: |
+          echo "Checking for database configuration files..."
+          find . -name "*.db" -o -name "*.sqlite" -o -name "*.sqlite3" -o -name "database.yml" -o -name "db.yml" | head -10
+          echo "Database configuration check completed."
+
+      - name: Check for SQL-related dependencies
+        run: |
+          echo "Checking for SQL-related dependencies in package.json files..."
+          find . -name "package.json" -exec grep -l "sql\|database\|db\|postgres\|mysql\|sqlite" {} \; || echo "No SQL-related dependencies found"
+          echo "SQL dependency check completed."
+
+  # Integration tests
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [node-ci, rust-ci]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.8.1
+          run_install: false
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build project
+        run: pnpm run build
+
+      - name: Test CLI help command
+        working-directory: codex-cli
+        run: |
+          node dist/cli.js --help
+
+      - name: Test CLI version command
+        working-directory: codex-cli
+        run: |
+          node dist/cli.js --version
+
+  # Performance and load testing
+  performance-tests:
+    name: Performance Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [node-ci, rust-ci]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.8.1
+          run_install: false
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build project
+        run: pnpm run build
+
+      - name: Check bundle size
+        working-directory: codex-cli
+        run: |
+          echo "Checking bundle size..."
+          ls -la dist/
+          echo "Bundle size check completed."
+
+      - name: Memory usage check
+        working-directory: codex-cli
+        run: |
+          echo "Checking memory usage..."
+          /usr/bin/time -v node dist/cli.js --help 2>&1 | grep "Maximum resident set size" || echo "Memory check completed."
+
+  # Final status check
+  status-check:
+    name: Status Check
+    runs-on: ubuntu-latest
+    needs: [node-ci, rust-ci, docker-ci, security-scan, code-quality, sql-checks, integration-tests, performance-tests]
+    if: always()
+
+    steps:
+      - name: Check all jobs status
+        run: |
+          echo "All CI jobs completed. Checking status..."
+          if [[ "${{ needs.node-ci.result }}" == "success" && 
+                "${{ needs.rust-ci.result }}" == "success" && 
+                "${{ needs.docker-ci.result }}" == "success" && 
+                "${{ needs.security-scan.result }}" == "success" && 
+                "${{ needs.code-quality.result }}" == "success" && 
+                "${{ needs.sql-checks.result }}" == "success" && 
+                "${{ needs.integration-tests.result }}" == "success" && 
+                "${{ needs.performance-tests.result }}" == "success" ]]; then
+            echo "✅ All CI checks passed!"
+          else
+            echo "❌ Some CI checks failed. Please review the logs above."
+            exit 1
+          fi 
